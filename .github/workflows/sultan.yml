@@ -105,9 +105,6 @@ jobs:
 
           perl -0pi -e 's/if \(IS_ERR\(f\)\) \{/if (IS_ERR(f) && !libperfmgr_redirect(&f, dfd, tmp, &op, how)) {/g' fs/open.c
           
-          cp ../kernel_patches/sultan/sys.c_fix.patch ./
-          patch -p1 < sys.c_fix.patch
-
           cd KernelSU-Next
           cp ${{ github.workspace }}/kernel_patches/wild/ksun-293ca01-susfs-v2.1.0-a14-6.1-ef16cbce.patch ./
           patch -p1 < ksun-293ca01-susfs-v2.1.0-a14-6.1-ef16cbce.patch
