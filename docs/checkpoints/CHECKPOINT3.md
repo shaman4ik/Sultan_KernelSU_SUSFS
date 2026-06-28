@@ -102,3 +102,40 @@ tensynos-специфична и `fix-susfs-compat` её НЕ делает.
 5. **CP4:** `CONFIG_ZEROMOUNT` лёг только в `gki_defconfig`, НЕ в `gs201_defconfig` →
    на CP4 завести его в `gs201_defconfig` через `defconfig.fragment`/assemble-defconfig.
 6. **0 .rej** — формальный критерий CP3 рунбука выполнен (после ручной newuname-правки).
+
+---
+
+## Приложение — верификация перед CP5 (по запросу ревью)
+
+### A. newuname — один когерентный путь спуфа
+- В `kernel/sys.c` ровно **2** упоминания `susfs_spoof_uname`: `extern` декл (внутри
+  `#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME`) + один вызов. **Дубля нет.**
+- Важно: чистое дерево `kerneltoast/...tensynos@16.0.0-sultan` НЕ несёт собственного
+  `susfs_spoof_uname` в `newuname` (проверено на свежем клоне до патчей). Формулировка
+  старого рунбука «у kerneltoast уже вставлен» относилась к stray-`sys.c` прошлой сессии,
+  не к чистому дереву. Наша вставка — единственная.
+- Гейт: и декл, и вызов — под `#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME`.
+- Родная логика tensynos цела: вызов спуфа стоит между `memcpy(utsname())` и `up_read`;
+  ниже без изменений `struct task_struct *t; bool is_gms`, `for_each_thread`+`rcu`,
+  и `if (is_gms) snprintf(tmp.release,…,LINUX_VERSION…)`.
+- Взаимодействие: для app `id.gms.unstable` tensynos НАМЕРЕННО перезаписывает `tmp.release`
+  реальной версией ПОСЛЕ спуфа (его штатное поведение для Play Integrity) — мы это не трогали.
+  Для всех остальных uid susfs-спуф остаётся в силе. Конфликта нет.
+- (libperfmgr-массаж — это `fs/open.c`, к `newuname` отношения не имеет; его удаление
+  на эту функцию не влияет.)
+
+### B. Гейт-конфиг долетит =y (формально CP4, но смысл правки A)
+- `zeromount/defconfig.fragment` секция `# [susfs]` содержит `CONFIG_KSU_SUSFS_SPOOF_UNAME=y`.
+- **CP4-действие:** `assemble-defconfig.sh … gs201_defconfig --susfs` тянет секцию `[susfs]`
+  в `gs201_defconfig` → символ долетает `=y`, `#ifdef` компилит спуф РЕАЛЬНО (не в ноль).
+  Проверить на CP4 grep'ом по итоговому `gs201_defconfig`.
+
+### C. 60_ zeromount-VFS-хуки сели ВНУТРЬ нужных функций (не «patch success с fuzz»)
+- `fs/stat.c`: `zeromount_stat_hook(dfd,filename,stat,…)` — внутри `vfs_statx`
+  (резолвер по filename+dfd), после KSU-блока `orig_flow:`, под `#ifdef CONFIG_ZEROMOUNT`,
+  ранний возврат при `zm_ret != -ENOENT`. ✓
+- `fs/statfs.c`: `zeromount_spoof_statfs(pathname, st)` — внутри `user_statfs()`,
+  ПОСЛЕ `vfs_statfs(&path, st)` (постобработка результата). ✓
+- `fs/d_path.c`: `zeromount_get_static_vpath(d_backing_inode(path->dentry))` — внутри
+  настоящего `d_path()`. ✓
+- Fuzz был только context-offset; семантическое размещение верное.
