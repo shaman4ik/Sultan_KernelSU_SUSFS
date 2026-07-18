@@ -49,8 +49,11 @@ spoof. Built with GCC 14.2 + LTO, packaged as AnyKernel3 (`Image.lz4` + gs201 `d
 - Back up `boot` / `vendor_kernel_boot` first. A bad flash → reboot into stock (no bootloop by design).
 
 **Gesture-nav module** (optional — only if your device is soft-debloated the same way):
-- KernelSU/Magisk manager → Modules → Install from storage → `gesturenav-module-*.zip` → reboot.
-- Needs a ZeroMount kernel (this one); on a non-ZeroMount kernel it silently no-ops.
+- **KernelSU / ReSukiSU manager** (this kernel bakes in ReSukiSU, a KernelSU variant) →
+  Modules → Install from storage → `gesturenav-module-*.zip` → reboot.
+- Standard KernelSU-format module (`service.sh` at late_start). The real dependency is the
+  **kernel** — it needs ZeroMount's `61_` ioctl (`/dev/zeromount`), not any particular root
+  manager; on a non-ZeroMount kernel it silently no-ops.
 
 ---
 
