@@ -65,6 +65,9 @@ jobs:
           ANYKERNEL_BRANCH="sultan-${{ inputs.codename }}"
           echo "Using branch for AnyKernel3: $ANYKERNEL_BRANCH"
           git clone https://github.com/TheWildJames/AnyKernel3.git -b "$ANYKERNEL_BRANCH"
+          # Support Android 17 as well — upstream AnyKernel3 ships supported.versions=16 only,
+          # which makes do.devicecheck refuse to flash on A17 devices (gs201 runs fine on A17).
+          sed -i 's/^supported\.versions=16$/supported.versions=16 17/' AnyKernel3/anykernel.sh || true
           # Pin the kernel source to the branch CP3 was validated against (drift guard).
           git clone https://github.com/kerneltoast/android_kernel_google_tensynos -b 16.0.0-sultan --depth=1
 
