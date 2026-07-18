@@ -1,6 +1,7 @@
-# Sultan Kernel — ZeroMount edition (Pixel 7 / `panther`, gs201)
+# Sultan Kernel — ZeroMount edition (Pixel 7 / 7 Pro / 7a — gs201)
 
-A **Sultan** 6.1 kernel for the **Google Pixel 7 (panther, Tensor gs201)** with a
+A **Sultan** 6.1 kernel for the whole **Pixel 7 generation (Tensor G2 / `gs201`)** —
+Pixel 7 (`panther`), Pixel 7 Pro (`cheetah`), Pixel 7a (`lynx`) — with a
 kernel-level root-hiding stack that actually lands on Sultan's heavily-modified tree —
 **ZeroMount VFS + ReSukiSU + SUSFS**, plus a byte-for-byte stock-looking uname/version
 spoof. Built with GCC 14.2 + LTO, packaged as AnyKernel3 (`Image.lz4` + gs201 `dtb`).
@@ -32,7 +33,10 @@ spoof. Built with GCC 14.2 + LTO, packaged as AnyKernel3 (`Image.lz4` + gs201 `d
 
 ## Requirements
 
-- Device: **Pixel 7 `panther`** (gs201). **Not** 7 Pro (`cheetah`) or 7a (`lynx`).
+- Device: any **gs201 (Tensor G2)** — Pixel 7 (`panther`), 7 Pro (`cheetah`), or 7a (`lynx`).
+  One unified kernel: the `Image` + a generic `gs201` dtb are shared across all three;
+  device-specifics stay in each device's own `dtbo`. **Not** Pixel 6-gen (gs101) or
+  Pixel 8-gen (`zuma`/`zumapro`).
 - Unlocked bootloader + a KernelSU-based root manager (ReSukiSU/KernelSU).
 - A recent stock base (loads on stock 6.1.145+; equal-or-newer sublevel at the same KMI).
 
