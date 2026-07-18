@@ -1,0 +1,12 @@
+#!/system/bin/sh
+# KernelSU/Magisk module service.sh — runs at late_start (after /product mounted,
+# before/around PMS package scan). Place the compiled `zeromount_addchild` binary
+# next to this script in the module and mark it executable.
+MODDIR=${0%/*}
+BIN="$MODDIR/zeromount_addchild"
+
+[ -x "$BIN" ] || chmod 0755 "$BIN" 2>/dev/null
+
+# Re-surface soft-debloated /product/overlay children. Add one line per overlay.
+"$BIN" /product/overlay NavigationBarModeGestural --dir
+# "$BIN" /product/overlay <AnotherHiddenOverlay> --dir

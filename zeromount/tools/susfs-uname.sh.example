@@ -1,0 +1,44 @@
+#!/system/bin/sh
+# Set uname(2) to stock panther CP2A.260705.006 via susfs runtime spoof.
+# Run as root at boot (KernelSU/Magisk service.sh, late_start). Needs the
+# susfs userspace binary `ksu_susfs` (from sidex15/ksu_module_susfs or the
+# susfs manager) present in PATH or give its full path.
+#
+# WHY runtime (not a Makefile SUBLEVEL bump): bumping SUBLEVEL 145->157 raises
+# LINUX_VERSION_CODE past thresholds that version-gated in-tree code (mali_kbase
+# MIN/MAX, etc.) assumes are backported in real 6.1.157 but are absent in this
+# 6.1.145 tree -> build break. susfs_set_uname rewrites the release/version for
+# every uname(2) with no effect on LINUX_VERSION_CODE, so the kernel still
+# compiles and boots at its real 6.1.145 while `uname -r/-v/-a` read stock.
+
+RELEASE="6.1.157-android14-11-gbd23337e42e7-ab14791245"
+# uname -v of stock panther CP2A.260705.006. Capture the exact string from a
+# stock boot (`uname -v`) and paste it here; the timestamp below matches the
+# stock build. Format is "#<n> SMP PREEMPT <date>".
+VERSION="#1 SMP PREEMPT Wed Jan 28 05:34:14 UTC 2026"
+
+# Two ways to apply — both end at the same kernel ioctl
+# CMD_SUSFS_SET_UNAME (0x55590), struct st_susfs_uname { char release[65];
+# char version[65]; }. Only release + version are spoofable (=> uname -r / -v);
+# sysname/nodename/machine are untouched (already stock: Linux / host / aarch64).
+#
+# (a) CLI (ksu_susfs binary). "default" leaves a field unchanged:
+ksu_susfs set_uname "$RELEASE" "$VERSION"
+#
+# (b) Manager / module config (embedded setups) — a [uname] section, no CLI:
+#       [uname]
+#       release = 6.1.157-android14-11-gbd23337e42e7-ab14791245
+#       version = #1 SMP PREEMPT Wed Jan 28 05:34:14 UTC 2026
+#     (exact key/section names depend on your susfs manager; it calls the same
+#      ioctl under the hood.) Max 64 chars per field.
+
+# Verify:
+#   uname -r   -> 6.1.157-android14-11-gbd23337e42e7-ab14791245
+#   uname -v   -> #1 SMP PREEMPT Wed Jan 28 05:34:14 UTC 2026
+#   uname -a   -> both, combined
+#
+# NOTE: /proc/version is a separate proc file (not the uname syscall). This tree
+# reports 6.1.145 there, and the compiler substring is GCC 14.2.0 (stock = AOSP
+# Clang 17.0.2). Making /proc/version 1:1 needs a toolchain swap (Tier-2 #7),
+# tracked separately. The kernel build itself already brands its banner/localver
+# as 6.1.145-android14-11-gbd23337e42e7-ab14791245 (no -Sultan tell).

@@ -1,0 +1,505 @@
+name: Sultan
+permissions:
+  contents: write # Allow writing to repository contents (for pushing tags)
+  actions: write # Allows triggering actions
+
+on:
+  workflow_call: # This allows this workflow to be called from another workflow
+    inputs:
+      codename:
+        required: true
+        type: string
+      android_version:
+        required: true
+        type: string
+      kernel_version:
+        required: true
+        type: string
+      matrix_features:
+        required: false
+        type: string
+        default: '["resukisu-zeromount","resukisu-fresh"]'
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Stage 1 (Replace): susfs v2.0.0 + ZeroMount on gs201/panther (device build).
+        # ReSukiSU only — it uses manual inline hooks (its `config KSU` has no deps).
+        # KernelSU-Next was dropped: its `config KSU` depends on KPROBES, and KPROBES
+        # `depends on MODULES`, but gs201 is a monolithic tree (INTEGRATE_MODULES, no
+        # loadable modules) where MODULES won't enable — so KSU-Next can't activate here.
+        # The ksunext-zeromount steps below stay gated/dormant for reference.
+        #   resukisu-fresh — experiment: ReSukiSU fresh pin 2206a7dd, which adds a
+        #   static_export_check build guard; satisfied by de-static'ing sel_handle_status_ops.
+        #   Runs in parallel so the proven 47167aa7 artifact is always produced.
+        features: ${{ fromJSON(inputs.matrix_features) }}
+    steps:
+      - name: Checkout orchestration repo (vendored ./zeromount)
+        uses: actions/checkout@v4
+        with:
+          path: orchestration
+
+      - name: Download and extract GCC 14.2.0 toolchain
+        run: |
+          echo "Downloading GCC 14.2.0 cross-compiler toolchain..."
+          wget https://www.kernel.org/pub/tools/crosstool/files/bin/x86_64/14.2.0/x86_64-gcc-14.2.0-nolibc-aarch64-linux.tar.gz
+          echo "Extracting .gz file..."
+          gunzip x86_64-gcc-14.2.0-nolibc-aarch64-linux.tar.gz
+          echo "Extracting .tar file..."
+          tar -xf x86_64-gcc-14.2.0-nolibc-aarch64-linux.tar
+          echo "GCC 14.2.0 toolchain extracted successfully"
+
+      - name: Set CONFIG Environment Variable
+        run: |
+          CONFIG="android_kernel_google_tensynos"
+          echo "CONFIG=$CONFIG" >> $GITHUB_ENV
+          # Vendored ZeroMount/ReSukiSU set (patches + build-helpers + pin + fragment)
+          echo "ORCH=$GITHUB_WORKSPACE/orchestration/zeromount" >> $GITHUB_ENV
+          echo "CONFIG set to: $CONFIG"
+
+      - name: Clone AnyKernel3 and kernel source
+        run: |
+          ANYKERNEL_BRANCH="sultan-${{ inputs.codename }}"
+          echo "Using branch for AnyKernel3: $ANYKERNEL_BRANCH"
+          git clone https://github.com/TheWildJames/AnyKernel3.git -b "$ANYKERNEL_BRANCH"
+          # Pin the kernel source to the branch CP3 was validated against (drift guard).
+          git clone https://github.com/kerneltoast/android_kernel_google_tensynos -b 16.0.0-sultan --depth=1
+
+      - name: Integrate ReSukiSU + apply susfs/zeromount patches
+        if: matrix.features == 'resukisu-zeromount' || matrix.features == 'resukisu-fresh'
+        run: |
+          set -uo pipefail
+          cd "$CONFIG"
+
+          echo "::group::ReSukiSU setup (pinned)"
+          # setup.sh is fetched from ReSukiSU/main; the integrated source is then PINNED
+          # to a per-variant pin file so the moving branch can't drift the build.
+          #   resukisu-zeromount -> resukisu-pin.txt        (47167aa7, proven bootable)
+          #   resukisu-fresh     -> resukisu-fresh-pin.txt  (2206a7dd, experiment)
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s susfs-ksud
+          KSU_DIR=KernelSU
+          if [ ! -d "$KSU_DIR" ]; then echo "FATAL: ReSukiSU setup did not create $KSU_DIR"; exit 1; fi
+          if [ "${{ matrix.features }}" = "resukisu-fresh" ]; then
+            PIN="$(cat "$ORCH/resukisu-fresh-pin.txt")"
+          else
+            PIN="$(cat "$ORCH/resukisu-pin.txt")"
+          fi
+          ( cd "$KSU_DIR" && git fetch origin && git checkout "$PIN" )
+          echo "ReSukiSU pinned to $PIN"
+          echo "::endgroup::"
+
+          AV="${{ inputs.android_version }}"; KV="${{ inputs.kernel_version }}"
+          PATCHES="$ORCH/patches"
+
+          echo "::group::Apply 50_ / 51_ (susfs base, in tree root)"
+          patch -p1 -F3 --no-backup-if-mismatch < "$PATCHES/50_add_susfs_in_gki-${AV}-${KV}.patch" || true
+          # tensynos custom newuname: 50_ Hunk#3 rejects -> resolve the spoof insertion by hand
+          bash "$ORCH/build-helpers/fix-tensynos-newuname.sh" kernel/sys.c
+          rm -f kernel/sys.c.rej
+          patch -p1 -F3 --no-backup-if-mismatch < "$PATCHES/51_enhanced_susfs-${AV}-${KV}.patch" || true
+          echo "::endgroup::"
+
+          echo "::group::Apply 70_ (ReSukiSU supercall safety, in KSU dir) then supercalls massage"
+          P70="$PATCHES/70_ksu_safety-resukisu-${KV}.patch"
+          ( cd "$KSU_DIR" && { [ -s "$P70" ] && patch -p1 --no-backup-if-mismatch < "$P70" || echo "no 70_ patch needed"; } )
+          # Post-setup massage (order: AFTER 70_, see CHECKPOINT3 — sed-first rejects 70_ Hunk#1).
+          SUPER="drivers/kernelsu/supercalls.c"
+          if [ -f "$SUPER" ]; then
+            sed -i '/ksu_mark_running_process/d' "$SUPER"
+            if grep -q "vzalloc" "$SUPER" && ! head -5 "$SUPER" | grep -q "vmalloc.h"; then
+              sed -i '1a #include <linux/vmalloc.h>' "$SUPER"
+            fi
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Apply 60_ (ZeroMount VFS, in tree root)"
+          patch -p1 -F3 --no-backup-if-mismatch < "$PATCHES/60_zeromount-${AV}-${KV}.patch" || true
+          echo "::endgroup::"
+
+          echo "::group::61_ zeromount force-dir-child ioctl (ADD_DIR_CHILD)"
+          # anchor-based injector on top of pristine 60_ output; loud on missing anchor
+          bash "$ORCH/build-helpers/zeromount-force-dir-child.sh" .
+          echo "::endgroup::"
+
+          echo "::group::fix-susfs-compat (sublevel-dependent source fixes)"
+          SUBLEVEL="$(awk '/^SUBLEVEL =/{print $3}' Makefile)"
+          echo "SUBLEVEL=$SUBLEVEL"
+          bash "$ORCH/build-helpers/fix-susfs-compat.sh" . "$SUBLEVEL" "$AV" "$KV" "" || true
+          echo "::endgroup::"
+
+          if [ "${{ matrix.features }}" = "resukisu-fresh" ]; then
+            echo "::group::fresh ReSukiSU static_export_check — de-static selinux symbols"
+            # 2206a7dd added a build guard requiring sel_handle_status_ops (and friends)
+            # to be non-static. 47167aa7 has no such check, so this runs for fresh only.
+            bash "$ORCH/build-helpers/fix-resukisu-selinux-export.sh" .
+            echo "::endgroup::"
+          fi
+
+          echo "::group::ksu_file sepolicy stealth (mode from ksu-sepolicy.conf)"
+          # Removes/renames ReSukiSU's SELinux type ksu_file to kill the Duck oracle.
+          # mode=cut comments out the 3 KERNEL_SU_FILE injection lines (no type, no
+          # allow). mode=keep = no-op. See ksu-sepolicy.conf.
+          bash "$ORCH/build-helpers/fix-ksu-sepolicy-stealth.sh" . "$ORCH/ksu-sepolicy.conf"
+          echo "::endgroup::"
+
+          echo "::group::ksu policyload seqno-split stealth (mode from ksu-policyload.conf)"
+          # Replaces reset_avc_cache()'s hardcoded selinux_status_update_policyload(0)
+          # with a real seqno (latest_granting) and makes apply_kernelsu_rules notify
+          # after unlock — kills the Duck "access moved but policyload==0" split.
+          # mode=off = no-op. See ksu-policyload.conf.
+          bash "$ORCH/build-helpers/fix-ksu-policyload-seqno.sh" . "$ORCH/ksu-policyload.conf"
+          echo "::endgroup::"
+
+          echo "::group::Strict reject gate (CP3 criterion: zero .rej)"
+          if find . -name '*.rej' | grep -q .; then
+            echo "FATAL: unresolved rejects present:"; find . -name '*.rej'
+            exit 1
+          fi
+          echo "no .rej — clean"
+          echo "::endgroup::"
+
+      - name: Integrate KernelSU-Next + apply susfs/zeromount patches
+        if: matrix.features == 'ksunext-zeromount'
+        run: |
+          set -uo pipefail
+          cd "$CONFIG"
+
+          echo "::group::KernelSU-Next setup (pinned)"
+          # setup.sh from KernelSU-Next/stable; the integrated source is then PINNED
+          # to kernelsu-next-pin.txt so the moving branch can't drift the build.
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/stable/kernel/setup.sh" | bash -s stable
+          KSU_DIR=KernelSU-Next
+          if [ ! -d "$KSU_DIR" ]; then echo "FATAL: KernelSU-Next setup did not create $KSU_DIR"; exit 1; fi
+          PIN="$(cat "$ORCH/kernelsu-next-pin.txt")"
+          ( cd "$KSU_DIR" && git fetch origin && git checkout "$PIN" )
+          echo "KernelSU-Next pinned to $PIN"
+          echo "::endgroup::"
+
+          AV="${{ inputs.android_version }}"; KV="${{ inputs.kernel_version }}"
+          PATCHES="$ORCH/patches"
+
+          echo "::group::Apply 50_ / 51_ (susfs base, in tree root) — identical patches to ReSukiSU path"
+          patch -p1 -F3 --no-backup-if-mismatch < "$PATCHES/50_add_susfs_in_gki-${AV}-${KV}.patch" || true
+          # tensynos custom newuname: 50_ Hunk#3 rejects -> resolve the spoof insertion by hand
+          bash "$ORCH/build-helpers/fix-tensynos-newuname.sh" kernel/sys.c
+          rm -f kernel/sys.c.rej
+          patch -p1 -F3 --no-backup-if-mismatch < "$PATCHES/51_enhanced_susfs-${AV}-${KV}.patch" || true
+          echo "::endgroup::"
+
+          echo "::group::Apply 70_ (KernelSU-Next supercall safety, in KSU dir) then supercalls massage"
+          P70="$PATCHES/70_ksu_safety-kernelsu-next-${KV}.patch"
+          ( cd "$KSU_DIR" && { [ -s "$P70" ] && patch -p1 --no-backup-if-mismatch < "$P70" || echo "no 70_ patch needed"; } )
+          # KernelSU-Next supercalls: only the vmalloc.h include fixup (no ksu_mark_running_process
+          # removal — that is a ReSukiSU-only massage). Mirrors Super-Builders/build-ksu-next.yml.
+          SUPER="drivers/kernelsu/supercalls.c"
+          if [ -f "$SUPER" ]; then
+            if grep -q "vzalloc" "$SUPER" && ! head -5 "$SUPER" | grep -q "vmalloc.h"; then
+              sed -i '1a #include <linux/vmalloc.h>' "$SUPER"
+            fi
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Apply 60_ (ZeroMount VFS, in tree root)"
+          patch -p1 -F3 --no-backup-if-mismatch < "$PATCHES/60_zeromount-${AV}-${KV}.patch" || true
+          echo "::endgroup::"
+
+          echo "::group::fix-susfs-compat (sublevel-dependent source fixes)"
+          SUBLEVEL="$(awk '/^SUBLEVEL =/{print $3}' Makefile)"
+          echo "SUBLEVEL=$SUBLEVEL"
+          bash "$ORCH/build-helpers/fix-susfs-compat.sh" . "$SUBLEVEL" "$AV" "$KV" "" || true
+          echo "::endgroup::"
+
+          echo "::group::Strict reject gate (CP3 criterion: zero .rej)"
+          if find . -name '*.rej' | grep -q .; then
+            echo "FATAL: unresolved rejects present:"; find . -name '*.rej'
+            exit 1
+          fi
+          echo "no .rej — clean"
+          echo "::endgroup::"
+
+      - name: Assemble defconfig (susfs + overlayfs + ZeroMount)
+        if: matrix.features == 'resukisu-zeromount' || matrix.features == 'ksunext-zeromount' || matrix.features == 'resukisu-fresh'
+        run: |
+          set -uo pipefail
+          cd "$CONFIG"
+          DEFCONFIG="arch/arm64/configs/${{ inputs.codename }}_defconfig"
+          # [base]=CONFIG_KSU=y always; --susfs pulls [susfs] (incl CONFIG_KSU_SUSFS_SPOOF_UNAME=y);
+          # --overlayfs pulls TMPFS_XATTR/POSIX_ACL (mountify). No --kleaf: legacy make path.
+          bash "$ORCH/build-helpers/assemble-defconfig.sh" "$ORCH/defconfig.fragment" /tmp/frag.dst "$DEFCONFIG" --susfs --overlayfs
+          # ZeroMount is NOT in the fragment (60_ only patched gki_defconfig) -> add it to the device defconfig.
+          grep -q '^CONFIG_ZEROMOUNT=y' "$DEFCONFIG" || echo 'CONFIG_ZEROMOUNT=y' >> "$DEFCONFIG"
+          # KernelSU-Next's `config KSU` has `depends on KPROBES && EXT4_FS`; gs201_defconfig ships
+          # KPROBES off, so make silently drops CONFIG_KSU and every CONFIG_KSU_SUSFS_* (only ZeroMount
+          # survives). ReSukiSU's `config KSU` has no such dep, so it is untouched. ksunext-only.
+          if [ "${{ matrix.features }}" = "ksunext-zeromount" ]; then
+            # KernelSU-Next `config KSU` depends on KPROBES && EXT4_FS; and KPROBES itself
+            # `depends on MODULES && HAVE_KPROBES`. arm64 selects HAVE_KPROBES, EXT4_FS=y is
+            # already set, but gs201_defconfig ships no CONFIG_MODULES=y (it uses
+            # INTEGRATE_MODULES / built-in modules), so MODULES defaults n -> KPROBES can't
+            # enable -> CONFIG_KSU + all CONFIG_KSU_SUSFS_* silently drop. Enable the full dep
+            # chain (ksunext only; ReSukiSU has no KPROBES dep and is left untouched).
+            grep -q '^CONFIG_MODULES=y' "$DEFCONFIG" || echo 'CONFIG_MODULES=y' >> "$DEFCONFIG"
+            grep -q '^CONFIG_KPROBES=y' "$DEFCONFIG" || echo 'CONFIG_KPROBES=y' >> "$DEFCONFIG"
+            grep -q '^CONFIG_EXT4_FS=y'  "$DEFCONFIG" || echo 'CONFIG_EXT4_FS=y'  >> "$DEFCONFIG"
+          fi
+          echo "=== CP4 grep on INPUT defconfig ($DEFCONFIG) ==="
+          grep -nE "CONFIG_ZEROMOUNT|CONFIG_KSU=|CONFIG_KSU_SUSFS=|CONFIG_KSU_SUSFS_SPOOF_UNAME" "$DEFCONFIG" || true
+
+      - name: Brand localversion (stock uname 1:1)
+        if: matrix.features == 'resukisu-zeromount' || matrix.features == 'ksunext-zeromount' || matrix.features == 'resukisu-fresh'
+        run: |
+          cd "$CONFIG"
+          DEF="./arch/arm64/configs/${{ inputs.codename }}_defconfig"
+          # Target uname -r = stock panther CP2A.260705.006:
+          #   6.1.157-android14-11-gbd23337e42e7-ab14791245
+          # 6.1 = VERSION.PATCHLEVEL (already, native). The KMI suffix is baked
+          # into CONFIG_LOCALVERSION below (the -g<hash>/-ab part is Google's and
+          # unreproducible, so it's a literal string).
+          # NATIVE .157 via UTS_RELEASE override (native-157.sh): hardcode
+          # include/config/kernel.release to the stock string so UTS_RELEASE ->
+          # uname(2), /proc/version, osrelease AND module vermagic all read
+          # 6.1.157 consistently. SUBLEVEL stays 145, so LINUX_VERSION_CODE is
+          # untouched -> version-gated code (mali/wlan) compiles as-is, no shims,
+          # and no runtime susfs spoof (which desynced /proc/version).
+          bash "$ORCH/build-helpers/native-157.sh" .
+
+          # LINUX_COMPILER override (/proc/version compiler substring -> stock Clang
+          # banner while codegen stays GCC). NO-OP until zeromount/stock-compiler.txt
+          # holds the exact byte-for-byte stock string (placeholder = skip).
+          bash "$ORCH/build-helpers/native-compiler.sh" . "$ORCH/stock-compiler.txt"
+
+          # CONFIG_LOCALVERSION := "" : the stock suffix now lives solely in the
+          # hardcoded kernel.release, so keep the defconfig from appending anything
+          # on top (single source of truth; also strips any -Sultan* branding).
+          if grep -q '^CONFIG_LOCALVERSION=' "$DEF"; then
+            sed -i -E 's|^CONFIG_LOCALVERSION=".*"|CONFIG_LOCALVERSION=""|' "$DEF"
+          else
+            echo 'CONFIG_LOCALVERSION=""' >> "$DEF"
+          fi
+
+          # CONFIG_LOCALVERSION_AUTO OFF — else the git tree appends its own
+          # -g<hash>, breaking the 1:1 match.
+          sed -i -E '/^CONFIG_LOCALVERSION_AUTO=y/d' "$DEF"
+          grep -q '^# CONFIG_LOCALVERSION_AUTO is not set' "$DEF" \
+            || echo '# CONFIG_LOCALVERSION_AUTO is not set' >> "$DEF"
+
+          # setlocalversion: never append the "+" dirty/untagged marker.
+          sed -i '/echo "+"$/d' scripts/setlocalversion || true
+
+          echo "=== uname-branding defconfig lines ==="
+          grep -nE '^CONFIG_LOCALVERSION|LOCALVERSION_AUTO' "$DEF" || true
+
+      - name: Build the Kernel
+        run: |
+          echo "Changing to configuration directory: $CONFIG..."
+          cd "$CONFIG"
+
+          # Tier-2: full /proc/version 1:1 with stock (user@host + timestamp).
+          # (Compiler substring still shows GCC 14.2.0 — stock uses AOSP Clang
+          #  17.0.2; matching that needs a toolchain swap, tracked separately.)
+          export KBUILD_BUILD_USER="build-user"
+          export KBUILD_BUILD_HOST="build-host"
+          export KBUILD_BUILD_TIMESTAMP="Wed Jan 28 05:34:14 UTC 2026"
+
+          make CROSS_COMPILE=$GITHUB_WORKSPACE/gcc-14.2.0-nolibc/aarch64-linux/bin/aarch64-linux- CC=$GITHUB_WORKSPACE/gcc-14.2.0-nolibc/aarch64-linux/bin/aarch64-linux-gcc -j$(nproc --all) ${{ inputs.codename }}_defconfig
+
+          # Definitive UTS_RELEASE check (~seconds, before the ~20 min compile).
+          # `make show` only proved the override macro EXPANDS to 6.1.157; this proves
+          # tensynos actually generates kernel.release THROUGH filechk_kernel.release
+          # (not via a custom script/direct write that bypasses the override). Generate
+          # only utsrelease.h and read the exact string the banner compiles from — it
+          # also exposes any accidental second localversion suffix.
+          make CROSS_COMPILE=$GITHUB_WORKSPACE/gcc-14.2.0-nolibc/aarch64-linux/bin/aarch64-linux- CC=$GITHUB_WORKSPACE/gcc-14.2.0-nolibc/aarch64-linux/bin/aarch64-linux-gcc -j$(nproc --all) include/generated/utsrelease.h 2>/dev/null || true
+          EXP="6.1.157-android14-11-gbd23337e42e7-ab14791245"
+          echo "=== UTS_RELEASE definitive check (expect \"$EXP\") ==="
+          UTS_OK=0
+          while IFS= read -r f; do
+            echo "-- $f --"; cat "$f"
+            grep -q "\"$EXP\"" "$f" && UTS_OK=1
+          done < <(find . -path '*/include/generated/utsrelease.h' 2>/dev/null)
+          for k in $(find . -path '*/include/config/kernel.release' 2>/dev/null); do
+            echo "-- $k --"; cat "$k"
+          done
+          if [ "$UTS_OK" != "1" ]; then
+            echo "::group::native-157 machinery dump (override bypassed — adapt native-157.sh)"
+            grep -nE 'kernel\.release|KERNELRELEASE|UTS_RELEASE|utsrelease|setlocalversion' Makefile | head -40 || true
+            echo "::endgroup::"
+            echo "::error::UTS_RELEASE is not $EXP — tensynos generates kernel.release outside filechk_kernel.release; the override was not honored. Adapt before the full build."
+            exit 1
+          fi
+          echo "UTS_RELEASE override CONFIRMED on the real generation path: $EXP"
+
+          # Definitive LINUX_COMPILER check — only when the override is active (baked
+          # into scripts/mkcompile_h). Generate compile.h and assert the stock banner.
+          if grep -q 'native-compiler: LINUX_COMPILER override' scripts/mkcompile_h; then
+            EXPCC="$(grep -vE '^[[:space:]]*(#|$)' "$ORCH/stock-compiler.txt" | head -n1 | sed -e 's/[[:space:]]*$//')"
+            make CROSS_COMPILE=$GITHUB_WORKSPACE/gcc-14.2.0-nolibc/aarch64-linux/bin/aarch64-linux- CC=$GITHUB_WORKSPACE/gcc-14.2.0-nolibc/aarch64-linux/bin/aarch64-linux-gcc -j$(nproc --all) include/generated/compile.h 2>/dev/null || true
+            CH="$(find . -path '*/include/generated/compile.h' 2>/dev/null | head -1)"
+            echo "=== LINUX_COMPILER definitive check (expect \"$EXPCC\") ==="
+            [ -n "$CH" ] && grep -n 'LINUX_COMPILER' "$CH"
+            if [ -z "$CH" ] || ! grep -qF "\"$EXPCC\"" "$CH"; then
+              echo "::error::LINUX_COMPILER override not effective — see compile.h above (mkcompile_h form may differ; adapt native-compiler.sh)."
+              exit 1
+            fi
+            echo "LINUX_COMPILER override CONFIRMED: $EXPCC"
+          else
+            echo "LINUX_COMPILER override inactive (stock-compiler.txt is a placeholder) — /proc/version compiler stays native GCC 14.2.0"
+          fi
+
+          # Fail fast BEFORE the ~20 min compile if KSU/susfs got pruned by an unmet Kconfig dep
+          # (e.g. KSU-Next's KPROBES requirement). ZeroMount alone is not a valid KSU+susfs kernel.
+          CFG="out/.config"; [ -f "$CFG" ] || CFG=".config"
+          MISSING=""
+          for s in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SPOOF_UNAME CONFIG_ZEROMOUNT; do
+            if grep -q "^${s}=y" "$CFG"; then echo "gate OK  ${s}=y"; else echo "gate MISS ${s}"; MISSING="$MISSING $s"; fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::group::gate diagnostics (why did the symbols not resolve?)"
+            echo "-- dep state in $CFG --"
+            grep -E '^CONFIG_(KPROBES|EXT4_FS|MODULES|HAVE_KPROBES|KALLSYMS|KSU)\b|^# CONFIG_(KPROBES|EXT4_FS|MODULES|KSU) is not set' "$CFG" || echo "(no dep lines matched)"
+            echo "-- tail of input defconfig (did our appends land?) --"
+            tail -10 "arch/arm64/configs/${{ inputs.codename }}_defconfig"
+            echo "-- 'config KSU' definition(s) + deps --"
+            grep -rn -A4 '^config KSU$' drivers KernelSU-Next --include='Kconfig*' 2>/dev/null | head -30 || echo "(config KSU not found in tree — Kconfig wiring failed?)"
+            echo "-- 'config KPROBES' definition + deps --"
+            grep -rn -A8 '^config KPROBES$' arch kernel --include='Kconfig*' 2>/dev/null | head -30 || echo "(config KPROBES not found)"
+            echo "-- drivers/Kconfig + Makefile kernelsu wiring --"
+            grep -n 'kernelsu' drivers/Kconfig drivers/Makefile 2>/dev/null || echo "(no kernelsu wiring)"
+            echo "::endgroup::"
+            echo "::error::config gate failed for ${{ matrix.features }} — inactive symbol(s):$MISSING"
+            exit 1
+          fi
+          make CROSS_COMPILE=$GITHUB_WORKSPACE/gcc-14.2.0-nolibc/aarch64-linux/bin/aarch64-linux- CC=$GITHUB_WORKSPACE/gcc-14.2.0-nolibc/aarch64-linux/bin/aarch64-linux-gcc LOCALVERSION_AUTO=0 -j$(nproc --all)
+
+          # Definitive ksu_file sepolicy check — mode-aware (ksu-sepolicy.conf).
+          KSUMODE="$(grep -vE '^[[:space:]]*(#|$)' "$ORCH/ksu-sepolicy.conf" 2>/dev/null | sed -nE 's/^[[:space:]]*mode[[:space:]]*=[[:space:]]*//p' | head -n1 | tr -d '[:space:]' || true)"
+          VMX="out/vmlinux"; [ -f "$VMX" ] || VMX="vmlinux"
+          case "${KSUMODE:-keep}" in
+            cut)
+              RULES="$(find . -type f -name rules.c -path '*selinux*' 2>/dev/null | xargs grep -l 'zeromount cut ksu_file' 2>/dev/null | head -1 || true)"
+              echo "=== ksu_file CUT definitive check ==="
+              if [ -z "$RULES" ] || grep -nE 'KERNEL_SU_FILE' "$RULES" | grep -vqE 'zeromount cut ksu_file'; then
+                echo "::error::ksu_file CUT not applied — an active KERNEL_SU_FILE injection survives in rules.c."
+                [ -n "$RULES" ] && grep -nE 'KERNEL_SU_FILE' "$RULES" || true
+                exit 1
+              fi
+              echo "ksu_file CUT CONFIRMED: no active KERNEL_SU_FILE injection in $RULES (type + allow removed)"
+              echo "info: 'ksu_file' string occurrences left in $VMX (dead KSU_FILE_CONTEXT, not a SELinux type): $(strings "$VMX" 2>/dev/null | grep -c '\bksu_file\b' || echo '?')"
+              ;;
+            rename:*)
+              NAME="${KSUMODE#rename:}"
+              echo "=== ksu_file RENAME definitive check (name=$NAME) ==="
+              if strings "$VMX" 2>/dev/null | grep -q '\bksu_file\b'; then
+                echo "::error::literal 'ksu_file' still in $VMX after rename to $NAME — stragglers exist."; exit 1
+              fi
+              echo "ksu_file RENAME CONFIRMED: no 'ksu_file' literal in $VMX. REMINDER: binary-patch zm to '$NAME'."
+              ;;
+            *) echo "ksu_file sepolicy: mode=keep — type ksu_file unchanged" ;;
+          esac
+
+          # Definitive ksu policyload seqno-split check — mode-aware (ksu-policyload.conf).
+          PLMODE="$(grep -vE '^[[:space:]]*(#|$)' "$ORCH/ksu-policyload.conf" 2>/dev/null | sed -nE 's/^[[:space:]]*mode[[:space:]]*=[[:space:]]*//p' | head -n1 | tr -d '[:space:]' || true)"
+          case "${PLMODE:-off}" in
+            seqno|seqno+1)
+              PLR="$(find . -type f -name rules.c -path '*selinux*' 2>/dev/null | xargs grep -l 'zeromount hide-policyload' 2>/dev/null | head -1 || true)"
+              echo "=== ksu policyload seqno-split definitive check (mode=$PLMODE) ==="
+              if [ -z "$PLR" ]; then
+                echo "::error::policyload seqno fix not applied — no 'zeromount hide-policyload' marker in any selinux rules.c."; exit 1
+              fi
+              if grep -qE 'selinux_status_update_policyload\((&selinux_state, )?0\)' "$PLR"; then
+                echo "::error::a hardcoded selinux_status_update_policyload(...,0) survives in $PLR — trailing-0 write not eliminated."
+                grep -nE 'selinux_status_update_policyload\((&selinux_state, )?0\)' "$PLR"; exit 1
+              fi
+              echo "policyload seqno-split CONFIRMED: reset_avc_cache emits latest_granting seqno; apply_kernelsu_rules notifies after unlock; no trailing (...,0) in $PLR"
+              ;;
+            *) echo "ksu policyload: mode=off — stock reset_avc_cache(0) unchanged" ;;
+          esac
+
+      - name: CP4 verify on generated .config
+        if: matrix.features == 'resukisu-zeromount' || matrix.features == 'ksunext-zeromount' || matrix.features == 'resukisu-fresh'
+        run: |
+          cd "$CONFIG"
+          CFG="out/.config"; [ -f "$CFG" ] || CFG=".config"
+          echo "=== CP4: configs that SURVIVED into $CFG ==="
+          grep -nE "^CONFIG_ZEROMOUNT=|^CONFIG_KSU=|^CONFIG_KSU_SUSFS=|^CONFIG_KSU_SUSFS_SPOOF_UNAME=" "$CFG" \
+            || echo "WARNING: expected configs missing from $CFG"
+
+      - name: Copy Images
+        run: |
+          echo "Changing to configuration directory: $CONFIG..."
+          cd "$CONFIG"
+
+          echo "Copying Image.lz4 and concatenating DTB files..."
+          cp ./out/arch/arm64/boot/Image.lz4 ../AnyKernel3/Image.lz4
+          if [ "${{ inputs.codename }}" == "gs201" ]; then
+            cat ./out/google-devices/gs201/dts/*.dtb > ../AnyKernel3/dtb
+            #cp ./out/google-devices/gs201/dts/dtbo.img ../AnyKernel3/dtbo.img
+          elif [ "${{ inputs.codename }}" == "zuma" ]; then
+            cat ./out/google-devices/zuma/dts/*.dtb > ../AnyKernel3/dtb
+          elif [ "${{ inputs.codename }}" == "zumapro" ]; then
+            cat ./out/google-devices/zumapro/dts/*.dtb > ../AnyKernel3/dtb
+          fi
+
+      - name: Create ZIP Files for Different Formats
+        run: |
+          echo "Navigating to AnyKernel3 directory..."
+          cd ./AnyKernel3
+
+          ZIP_NAME="${{ inputs.codename }}-a16-${{ matrix.features }}-anykernel3.zip"
+          echo "Creating zip file $ZIP_NAME..."
+          zip -r "../$ZIP_NAME" ./*
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ inputs.codename }}-${{ matrix.features }}
+          path: |
+            *.zip
+
+      - name: Collect .rej files
+        if: ${{ always() }}
+        id: collect_rej
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE"
+          rm -rf rej
+          mkdir -p rej
+
+          found="false"
+          while IFS= read -r -d '' rej_file; do
+            found="true"
+            original_file="${rej_file%.rej}"
+            rej_rel="${rej_file#./}"
+            original_rel="${original_file#./}"
+
+            mkdir -p "rej/$(dirname "$rej_rel")"
+            cp -f "$rej_file" "rej/$rej_rel"
+
+            if [[ -f "$original_file" ]]; then
+              mkdir -p "rej/$(dirname "$original_rel")"
+              cp -f "$original_file" "rej/$original_rel"
+            fi
+          done < <(find . -type f -name '*.rej' -print0)
+
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+
+      - name: Zip collected .rej bundle
+        if: ${{ always() && steps.collect_rej.outputs.found == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          zip -r "rej-${{ inputs.codename }}-${{ matrix.features }}.zip" rej
+
+      - name: Upload .rej bundle
+        if: ${{ always() && steps.collect_rej.outputs.found == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rej-${{ inputs.codename }}-${{ matrix.features }}
+          path: |
+            rej-${{ inputs.codename }}-${{ matrix.features }}.zip
