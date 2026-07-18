@@ -1,86 +1,74 @@
-# Wild Kernels for Android
+# Sultan Kernel — ZeroMount edition (Pixel 7 / `panther`, gs201)
 
-## Your warranty is no longer valid!
+A **Sultan** 6.1 kernel for the **Google Pixel 7 (panther, Tensor gs201)** with a
+kernel-level root-hiding stack that actually lands on Sultan's heavily-modified tree —
+**ZeroMount VFS + ReSukiSU + SUSFS**, plus a byte-for-byte stock-looking uname/version
+spoof. Built with GCC 14.2 + LTO, packaged as AnyKernel3 (`Image.lz4` + gs201 `dtb`).
 
-I am **not responsible** for bricked devices, damaged hardware, or any issues that arise from using this kernel.
-
-**Please** do thorough research and fully understand the features included in this kernel before flashing it!
-
-By flashing this kernel, **YOU** are choosing to make these modifications. If something goes wrong, **do not blame me**!
-
----
-
-### Proceed at your own risk!
+> Kernel source: [`kerneltoast/android_kernel_google_tensynos`](https://github.com/kerneltoast/android_kernel_google_tensynos) `@ 16.0.0-sultan` (cloned by the workflow).
+> This repo is the **build orchestration** (patch set + CI + helpers) over the vendored `./zeromount`.
 
 ---
 
-# Kernels:
- 
-[GKI](https://github.com/WildKernels/GKI_KernelSU_SUSFS)  
-[Sultan](https://github.com/WildKernels/Sultan_KernelSU_SUSFS)  
-[OnePlus](https://github.com/WildKernels/OnePlus_KernelSU_SUSFS)  
-[Legacy Pixels](https://github.com/WildKernels/Pixel_KernelSU_SUSFS)  
+## Features
+
+- **ZeroMount (VFS root-hiding)** — `CONFIG_ZEROMOUNT`. Hides root/module artifacts at the
+  **VFS layer** — not OverlayFS, not bind-mounts, no mount changes. WebUI capability reports
+  **VFS** (not OverlayFS). This is the notable part: ZeroMount was thought impossible on
+  Sultan's modified tree — here it works.
+- **ReSukiSU** — the KernelSU flavor used for root (pin `47167aa7`), with the
+  `70_ksu_safety-resukisu` supercall guards.
+- **SUSFS (v2.0.0)** — `50_add_susfs` + `51_enhanced_susfs`: mount/path/kstat hiding for
+  detection resistance, matched to the ZeroMount base version.
+- **Full uname / `/proc/version` spoof** — UTS release pinned to stock `6.1.157-android14-11`
+  and the compiler banner spoofed, so `uname` and `/proc/version` read **byte-identical to a
+  stock official build**. No "custom kernel" tell.
+- **Gesture-nav restore (`61_` force-dir-child)** — a ZeroMount ioctl
+  (`ZEROMOUNT_IOC_ADD_DIR_CHILD`) that re-surfaces a **soft-debloated** `/product/overlay`
+  child in `readdir` without touching the partition, so PackageManager re-enables gesture
+  navigation. Ships as an optional companion module (see Releases).
 
 ---
 
-# Other Links:
+## Requirements
 
-[Kernel Patches](https://github.com/WildKernels/kernel_patches)  
-[Old Build Scripts](https://github.com/TheWildJames/kernel_build_scripts)  
-[Horizon Kernel Flasher](https://github.com/libxzr/HorizonKernelFlasher)  
-
----
-
-# Installation instructions: 
-
-Follow the steps for GKI:  
-[Installation](https://kernelsu.org/guide/installation.html)
-
-To get boot.img format:  
-[Get My Kernel Format](https://github.com/TheWildJames/Get_My_Kernel_Format)
+- Device: **Pixel 7 `panther`** (gs201). **Not** 7 Pro (`cheetah`) or 7a (`lynx`).
+- Unlocked bootloader + a KernelSU-based root manager (ReSukiSU/KernelSU).
+- A recent stock base (loads on stock 6.1.145+; equal-or-newer sublevel at the same KMI).
 
 ---
 
-# Features
+## Install
 
-- **KernelSU**: KernelSU is a root solution for Android GKI devices, it works in kernel mode and grants root permission to userspace applications directly in kernel space.
-- **SUSFS**: An addon root hiding kernel patches and userspace module for KernelSU.
+**Kernel** (AnyKernel3 zip from Releases, or build via Actions):
+- ReSukiSU / KernelSU manager → flash the AnyKernel3 zip, **or** `fastboot boot` it first to test.
+- Back up `boot` / `vendor_kernel_boot` first. A bad flash → reboot into stock (no bootloop by design).
 
----
-
-# Credits
-
-- **KernelSU**: Developed by [tiann](https://github.com/tiann/KernelSU).
-- **KernelSU-Next**: Developed by [rifsxd](https://github.com/KernelSU-Next/KernelSU-Next).
-- **SUSFS**: Developed by [simonpunk](https://gitlab.com/simonpunk/susfs4ksu.git).
-- **SUSFS Module**: Developed by [sidex15](https://github.com/sidex15).
-- **Sultan Kernels**: Developed by [kerneltoast](https://github.com/kerneltoast).
-
-Special thanks to the open-source community for their contributions!
+**Gesture-nav module** (optional — only if your device is soft-debloated the same way):
+- KernelSU/Magisk manager → Modules → Install from storage → `gesturenav-module-*.zip` → reboot.
+- Needs a ZeroMount kernel (this one); on a non-ZeroMount kernel it silently no-ops.
 
 ---
 
-# Support
+## Build it yourself
 
-If you encounter any issues or need help, feel free to open an issue in this repository or reach out to me.
-
----
-
-# Disclaimer
-
-Flashing this kernel will void your warranty, and there is always a risk of bricking your device. Please make sure to back up your data and ensure you understand the risks before proceeding.
-
-**Proceed at your own risk!**
+`Actions → Build and Release Sultan Kernels → Run workflow` (branch `zeromount-panther`).
+Default `matrix_features` builds the stealth pair (`resukisu-zeromount` + `resukisu-fresh`).
+Artifact: `kernel-gs201-resukisu-zeromount` (AnyKernel3 zip).
 
 ---
 
-[Telegram](https://t.me/TheWildJames)  
-[Telegram Group](https://t.me/WildKernelsTG)  
+## Credits
 
-# Special thanks to the following people for their contributions!
-This helps me alot! <3
+Sultan / [kerneltoast](https://github.com/kerneltoast) (base tree) ·
+[WildKernels](https://github.com/WildKernels) (Sultan+KSU+SUSFS lineage) ·
+ReSukiSU · [simonpunk SUSFS](https://gitlab.com/simonpunk/susfs4ksu) ·
+ZeroMount (Enginex0). Orchestration + panther integration in this repo.
 
-[simonpunk](https://gitlab.com/simonpunk/susfs4ksu.git) - Created SUSFS!  
-[sidex15](https://github.com/sidex15) - Created module!
+---
 
-If you have contributed and are not here please remind me!
+## Disclaimer
+
+**Your warranty is now void.** Flashing a custom kernel is at **your own risk** — bricks,
+data loss, and broken features are possible. Understand what each feature does before you
+flash. By flashing, **you** chose to make these changes.
